@@ -82,8 +82,10 @@ app = FastAPI(
         "超时后重新走规则匹配；会话表容量固定，建会话遇容量满时按 "
         "last_seen 淘汰最早的存活会话。"
         "通过 /ipv4/reassemble 对同一 IPv4 数据报的 1～500 个分片按字节"
-        "区间重组：非末片载荷按 8 字节对齐，唯一末片锚定总载荷长度，"
-        "越过 65535 字节数据报上限报错；重复一致覆盖可接受，重叠字节冲突"
+        "区间重组：非末片载荷按 8 字节对齐，唯一末片锚定总载荷长度；"
+        "每片 offset 必须在 0～8191 内，且 offset*8 + 载荷长度 + 首部长度"
+        "不得越过 65535——逐片校验先于末片锚点裁剪，完全落在锚点外的分片"
+        "同样校验，不默默裁剪。重复一致覆盖可接受，重叠字节冲突"
         "返回首个冲突偏移，无冲突但有缺口返回合并后的缺失半开区间，覆盖"
         "完整时返回贡献分片索引与重组后的 Base64 载荷。"
         "通过 /ipv4/fragment 做反向的分片规划：给定 Base64 载荷、"
@@ -955,7 +957,13 @@ class IPv4Fragment(BaseModel):
 
     offset: int = Field(
         ..., ge=0, strict=True,
-        description="片偏移（fragment offset），以 8 字节为单位的非负整数",
+        description=(
+            "片偏移（fragment offset），以 8 字节为单位，合法范围 0～8191"
+            "（13 位片偏移字段）；超过 8191 返回 422 invalid_fragment_offset，"
+            "且 offset*8 + 解码后载荷长度 + header_bytes 不得越过 65535"
+            "（否则 422 datagram_too_large）——完全落在末片锚点外的分片"
+            "同样逐片校验"
+        ),
     )
     more_fragments: bool = Field(
         ...,
@@ -1000,14 +1008,17 @@ class IPv4ReassembleRequest(BaseModel):
         ...,
         min_length=1,
         max_length=FRAGMENTS_MAX,
-        description="同一数据报的分片列表（1～500 个，顺序任意）",
+        description=(
+            "同一数据报的分片列表（1～500 个，顺序任意）；每片 offset 必须在"
+            " 0～8191 内且 offset*8 + 载荷长度 + header_bytes 不超过 65535"
+        ),
     )
 
     @field_validator("header_bytes", mode="before")
     @classmethod
     def validate_header_bytes(cls, value: object) -> object:
         # 与核心层 reassemble_ipv4 共用 is_valid_header_length 规则，
-        # 且先于其他字段 / 核心层的末片、对齐与 65535 上限校验
+        # 且先于其他字段 / 核心层的末片、对齐与分片边界校验
         return validate_request_header_bytes(value)
 
 
@@ -2082,8 +2093,21 @@ def firewall_simulate(
                                 }
                             },
                         },
+                        "invalid_fragment_offset": {
+                            "summary": (
+                                "分片 offset 越过 13 位片偏移字段上限 8191"
+                                "（即使完全落在末片锚点外也报错，不默默裁剪）"
+                            ),
+                            "value": {
+                                "detail": {
+                                    "error": "invalid_fragment_offset",
+                                    "indexes": [2],
+                                    "limit": None,
+                                }
+                            },
+                        },
                         "datagram_too_large": {
-                            "summary": "末片锚定的总长度越过 IPv4 65535 字节上限",
+                            "summary": "分片绝对结束位置 offset*8 + 载荷长度 + 首部长度越过 IPv4 65535 字节上限",
                             "value": {
                                 "detail": {
                                     "error": "datagram_too_large",
@@ -2146,15 +2170,21 @@ def ipv4_reassemble(
       不是 4 字节倍数的值与越界 / 非整数输入一样返回 **422**
       （``error="invalid_header_length"``，``detail.header_bytes`` 给出实际
       值、``detail.allowed_values`` 给出完整合法值列表）。该校验先于末片、
-      对齐、数据报上限等全部后续判定；
-    - **非末片对齐**：除唯一一个 ``more_fragments=false`` 的末片外，其余分片
-      载荷长度必须是 **8 的倍数**，否则返回 **422**
-      （``error="non_aligned_fragment"``）；
+      对齐、分片边界等全部后续判定；
     - **末片定长**：必须**恰好一个** ``more_fragments=false`` 的末片，零个或
       多个均返回 **422**（``error="invalid_last_fragment_count"``）；末片按
       ``offset*8 + len(payload)`` 锚定总载荷长度；
-    - **长度上限**：首部长度 + 总载荷长度越过 IPv4 数据报 **65535** 字节上限
-      时返回 **422**（``error="datagram_too_large"``）；分片数 1～500；
+    - **非末片对齐**：除唯一一个 ``more_fragments=false`` 的末片外，其余分片
+      载荷长度必须是 **8 的倍数**，否则返回 **422**
+      （``error="non_aligned_fragment"``）；
+    - **分片边界（先于末片锚点裁剪逐片校验）**：每片 ``offset`` 必须是
+      **0～8191**（13 位片偏移字段）的整数，否则返回 **422**
+      （``error="invalid_fragment_offset"``，``indexes`` 给出违规分片序号）；
+      且每片 ``offset*8 + 载荷长度 + header_bytes`` 不得越过 IPv4 数据报
+      **65535** 字节上限，否则返回 **422**（``error="datagram_too_large"``，
+      ``limit=65535``，``indexes`` 给出违规分片序号）——**即使分片完全落在
+      末片锚点之外也照常校验**，不会被默默裁剪后报告 complete；末片的同一
+      不等式即“首部长度 + 总载荷长度 ≤ 65535”。分片数 1～500；
     - **重叠处理**：重复覆盖且重叠字节完全一致可接受；任一重叠字节不一致即
       返回 ``status="conflict"`` 与 **首个冲突偏移**
       ``first_conflict_offset``（全部分片中最小的不一致字节偏移，冲突结论
@@ -2167,8 +2197,9 @@ def ipv4_reassemble(
       ``contributing_fragments``（至少贡献一个总载荷字节的分片；空载荷或
       完全越界的分片不计入）与重组后完整载荷的标准 Base64 ``payload``。
 
-    非法 Base64、负/非整数 ``offset``、非布尔 ``more_fragments``、字段缺失等
-    同样返回 **422**。
+    通过边界校验但落在末片锚定总长度之外的分片仍按既有语义裁剪（不参与
+    重组）。非法 Base64、负/非整数 ``offset``、非布尔 ``more_fragments``、
+    字段缺失等同样返回 **422**。
     """
     try:
         return reassemble_ipv4(

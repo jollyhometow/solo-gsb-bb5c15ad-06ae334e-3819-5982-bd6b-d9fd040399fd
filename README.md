@@ -80,8 +80,12 @@ dst_port)`，在固定的 `session_timeout` 存活时间内，会话的后续正
 1～500 个分片（每片给出以 8 字节为单位的
 `offset`、`more_fragments` 标志与 Base64 编码的 `payload`），按字节区间
 `[offset*8, offset*8 + len(payload))` 重组。非末片载荷长度必须是 **8 的倍数**，
-且必须**恰好一个** `more_fragments=false` 的末片——末片锚定总载荷长度，
-首部加载荷越过 IPv4 **65535** 字节上限即返回 422。重复覆盖且字节一致可接受；
+且必须**恰好一个** `more_fragments=false` 的末片——末片锚定总载荷长度。
+每片 `offset` 必须在 **0～8191**（13 位片偏移字段）内，且
+`offset*8 + 载荷长度 + header_bytes` 不得越过 IPv4 **65535** 字节上限——
+逐片校验**先于末片锚点裁剪**，即使分片完全落在锚点之外也返回 422，
+不会默默裁剪后报告 complete（合法的锚点外分片仍按原语义裁剪）。
+重复覆盖且字节一致可接受；
 任一重叠字节冲突返回 `conflict` 与**首个冲突偏移**；无冲突但有缺口返回
 `incomplete` 与合并后的缺失**半开区间**；覆盖完整返回 `complete`、按偏移
 排序的贡献分片索引与重组后的 Base64 载荷。
@@ -1895,18 +1899,22 @@ curl -s http://localhost:8000/firewall/simulate \
    首部长度与 `19` / `61` / `20.0` / `"20"` / `true` 一样返回 **422**
    （`error="invalid_header_length"`，`detail.header_bytes` 给出实际值，
    `detail.allowed_values` 给出完整合法值列表）。该校验先于末片、对齐、
-   数据报上限等全部后续判定，多重非法输入稳定返回本错误。
-1. **非末片对齐**：除唯一一个 `more_fragments=false` 的末片外，其余分片
-   （非末片）的载荷长度必须是 **8 的倍数**，否则 **422**
-   （`error="non_aligned_fragment"`，`indexes` 给出首个违规分片序号）；
-   末片本身（长度由其锚定）**不要求** 8 字节对齐。
-2. **末片定长**：必须**恰好一个** `more_fragments=false` 的末片；零个或
+   分片边界等全部后续判定，多重非法输入稳定返回本错误。
+1. **末片定长**：必须**恰好一个** `more_fragments=false` 的末片；零个或
    多个均为 **422**（`error="invalid_last_fragment_count"`，多个时
    `indexes` 列出全部末片序号）。末片按
    `offset*8 + len(payload)` 确定总载荷长度。
-3. **长度上限**：`header_bytes + 总载荷长度` 越过 IPv4 数据报 **65535**
-   字节上限时 **422**（`error="datagram_too_large"`，`limit=65535`，
-   `indexes` 给出末片序号）。
+2. **非末片对齐**：除唯一末片外，其余分片（非末片）的载荷长度必须是
+   **8 的倍数**，否则 **422**（`error="non_aligned_fragment"`，`indexes`
+   给出首个违规分片序号）；末片本身（长度由其锚定）**不要求** 8 字节对齐。
+3. **分片边界（先于末片锚点裁剪，逐片校验）**：每片 `offset` 必须是
+   **0～8191**（13 位片偏移字段）的整数，否则 **422**
+   （`error="invalid_fragment_offset"`，`indexes` 给出违规分片序号）；
+   且每片 `offset*8 + 载荷长度 + header_bytes` 不得越过 IPv4 **65535**
+   字节上限，否则 **422**（`error="datagram_too_large"`，`limit=65535`，
+   `indexes` 给出违规分片序号）。**即使分片完全落在末片锚点之外也照常
+   校验**，不会被默默裁剪后报告 `complete`；末片的同一不等式即
+   “首部长度 + 总载荷长度 ≤ 65535”。
 4. **重叠与冲突**：重复覆盖处字节必须**完全一致**（重传分片可接受）；
    任一重叠字节不一致即返回 `status="conflict"` 与
    `first_conflict_offset`——全部分片中**最小**的不一致字节偏移。冲突
@@ -1919,8 +1927,9 @@ curl -s http://localhost:8000/firewall/simulate \
    **(字节偏移, 输入序号)** 升序；空载荷或完全落在总长度之外的分片不计
    入）与重组后完整载荷的标准 Base64 `payload`。
 
-分片**输入顺序任意**（乱序到达照样重组）。落在末片锚定总长度之外的字节
-不参与数据报重组（仅在总长度范围内做重叠校验与补全）。
+分片**输入顺序任意**（乱序到达照样重组）。通过边界校验但落在末片锚定
+总长度之外的字节不参与数据报重组（仅在总长度范围内做重叠校验与补全）；
+未通过边界校验的分片即使完全落在锚点之外也直接返回 422。
 
 #### 请求体
 
@@ -1930,7 +1939,11 @@ curl -s http://localhost:8000/firewall/simulate \
   非法值 422（`error="invalid_header_length"`，附带实际 `header_bytes`
   与完整 `allowed_values`）；不含在重组载荷内；
 - `fragments`：**1～500 个**同一数据报分片：
-  - `offset`：片偏移，**8 字节单位**的非负整数（拒绝负数、`1.5`、`true`）；
+  - `offset`：片偏移，**8 字节单位**、**0～8191**（13 位片偏移字段）的
+    整数（拒绝负数、`1.5`、`true`；超过 8191 返回 422
+    `invalid_fragment_offset`）；且每片
+    `offset*8 + 解码后载荷长度 + header_bytes` 不得越过 65535
+    （否则 422 `datagram_too_large`），完全落在末片锚点外的分片同样校验；
   - `more_fragments`：**布尔值** `true` / `false`（拒绝 `"false"` 等字符串），
     全请求必须**恰好一个** `false`；
   - `payload`：载荷的**标准 Base64** 编码（`validate` 严格解码，空串为
@@ -2038,8 +2051,8 @@ offset 0（8 字节）与 offset 2（末片 4 字节）已到，offset 1 缺失�
 #### 错误示例（422，非法首部长度）
 
 `header_bytes=21` 落在 20～60 之间但不是 4 字节倍数（IPv4 IHL 字段以
-32 位字为单位，只可能取 20/24/…/60）；该校验先于末片、对齐与 65535
-上限判定：
+32 位字为单位，只可能取 20/24/…/60）；该校验先于末片、对齐与分片
+边界判定：
 
 ```json
 {
@@ -2054,7 +2067,7 @@ offset 0（8 字节）与 offset 2（末片 4 字节）已到，offset 1 缺失�
 #### 错误示例（422，越过 65535 上限）
 
 `header_bytes=20`，末片位于 offset 8189（字节偏移 65512）且载荷 4 字节，
-总数据报长度 65536 > 65535：
+该分片绝对结束位置 65512 + 4 + 20 = 65536 > 65535：
 
 ```json
 {
@@ -2066,10 +2079,29 @@ offset 0（8 字节）与 offset 2（末片 4 字节）已到，offset 1 缺失�
 }
 ```
 
+#### 错误示例（422，分片 offset 越过 8191）
+
+末片锚定总长度 2，但分片 1 的 `offset=8192` 越过 13 位片偏移字段上限——
+即使该分片完全落在末片锚点之外，也返回 422 而不是裁剪后报告
+`complete`：
+
+```json
+{
+  "detail": {
+    "error": "invalid_fragment_offset",
+    "indexes": [1],
+    "limit": null
+  }
+}
+```
+
 其余语义错误同构：非末片未按 8 字节对齐
 （`{"error": "non_aligned_fragment", "indexes": [0], "limit": null}`）、
 末片数量不为一（`{"error": "invalid_last_fragment_count",
-"indexes": [...], "limit": null}`，`indexes` 列出全部末片）。
+"indexes": [...], "limit": null}`，`indexes` 列出全部末片）、任一分片
+（含完全落在末片锚点外的分片）`offset*8 + 载荷长度 + header_bytes`
+越过 65535（`{"error": "datagram_too_large", "indexes": [1],
+"limit": 65535}`，`indexes` 给出违规分片序号）。
 `invalid_header_length` 的 detail 不含 `indexes` / `limit`，而是给出
 实际 `header_bytes` 与完整 `allowed_values`。
 
@@ -2325,14 +2357,18 @@ curl -s http://localhost:8000/ipv4/fragment \
   不是 **20～60 范围内的 4 字节倍数**（含 `21` / `22` / `23` 等不可能
   值，或越界 / 非整数；`detail.error="invalid_header_length"`，
   `detail.header_bytes` 给出实际值、`detail.allowed_values` 给出完整
-  合法值列表；该校验先于末片、对齐与 65535 上限判定）、分片数不在
+  合法值列表；该校验先于末片、对齐与分片边界判定）、分片数不在
   1～500、`offset` 为负/非整数、
   `more_fragments` 非布尔、`payload` 不是合法标准 Base64；**非末片载荷
   长度不是 8 的倍数**（`detail.error="non_aligned_fragment"`，
   `detail.indexes` 给出违规分片序号）、**末片数量不为一**
   （`detail.error="invalid_last_fragment_count"`，`detail.indexes`
-  列出全部末片序号）、**首部加载荷越过 65535 字节上限**
-  （`detail.error="datagram_too_large"`，`detail.limit=65535`）
+  列出全部末片序号）、**分片 `offset` 越过 8191**
+  （`detail.error="invalid_fragment_offset"`，`detail.indexes` 给出
+  违规分片序号）、**任一分片 `offset*8 + 载荷长度 + header_bytes`
+  越过 65535 字节上限**（含完全落在末片锚点外的分片；
+  `detail.error="datagram_too_large"`，`detail.limit=65535`，
+  `detail.indexes` 给出违规分片序号）
 - `/ipv4/fragment` 缺少 `payload` / `header_bytes` / `mtu` /
   `dont_fragment`、`header_bytes` 不是 **20～60 范围内的 4 字节倍数**
   （含 `21` / `22` / `23` 等不可能值，或越界 / 非整数；
@@ -2408,11 +2444,14 @@ audit 与逐地址暴力“最长前缀 + 最低 metric + ECMP”oracle 交叉�
 首个冲突偏移取全部重叠对最小值且冲突优先于缺口、缺失半开区间合并
 （首部/中间/尾部缺口与相邻区间）、首部长度仅接受 20～60 内 4 字节倍数
 （21/22/23 拒绝、20/24/…/60 全边界接受，错误携带实际 header_bytes 与
-allowed_values，且先于末片/对齐/上限等全部判定）、非末片 8 字节对齐、
+allowed_values，且先于末片/对齐/边界等全部判定）、非末片 8 字节对齐、
 末片恰好一个与
 多末片下标报告、空末片零长度数据报、末片未对齐合法、65535 上限边界
-（含 60 字节首部）与越界分片裁剪、非法 Base64/类型/数量 422，以及随机
-分片重组与“删片后缺失区间集合”的 oracle 属性测试，
+（含 60 字节首部）与合法越界分片裁剪、分片边界逐片校验（offset 越过
+8191 报 invalid_fragment_offset、offset*8+载荷+首部越过 65535 报
+datagram_too_large，完全落在末片锚点外的分片同样校验且按输入顺序报告
+首个违规分片、校验次序晚于末片数量与对齐）、非法 Base64/类型/数量 422，
+以及随机分片重组与“删片后缺失区间集合”的 oracle 属性测试，
 `/ipv4/fragment` 的不超 MTU 原样返回（含保留原始片偏移/MF、DF 不触发）、
 首部长度仅接受 20～60 内 4 字节倍数（21/22/23 拒绝、20/24/…/60 全边界
 接受，错误携带实际 header_bytes 与 allowed_values，且先于 MTU/DF/对齐/
@@ -2439,7 +2478,7 @@ oracle 属性测试（含二次切分后偏移连续、仅最终子片 MF=false�
 │   ├── analyzer.py    # 核心：CIDR 解析、区间差集、最少 CIDR 压缩、规则分析、等价比较、裁决归因、包含层级与网段清单差异
 │   ├── router.py      # 核心：严格 IPv4 地址校验、最长前缀匹配 + 最低 metric 的 ECMP 路由解析、下一跳故障切换与整表空间审计
 │   ├── firewall.py    # 核心：有序五元组规则首条匹配、正向建会话、反向 stateful 放行（last_seen 刷新）、超时惰性清理与重判、固定容量 LRU 淘汰、乱序/重叠校验
-│   ├── reassembly.py  # 核心：IPv4 分片按字节区间重组、首部长度（20～60 内 4 字节倍数）/8 字节对齐/唯一末片/65535 上限校验、重叠冲突首个偏移、缺失半开区间合并、贡献分片排序
+│   ├── reassembly.py  # 核心：IPv4 分片按字节区间重组、首部长度（20～60 内 4 字节倍数）/8 字节对齐/唯一末片/分片边界（offset ≤ 8191 且 offset*8+载荷+首部 ≤ 65535，先于锚点裁剪逐片校验）、重叠冲突首个偏移、缺失半开区间合并、贡献分片排序
 │   ├── fragmentation.py # 核心：IPv4 分片规划——非末片 8 字节对齐与原数据报绝对结束位置 65535 前置校验（输出 offset ≤ 8191）、不超 MTU 原样返回、DF 超限报 needs_fragmentation、最大 8 字节倍数切片、子片偏移叠加原始偏移、末子片继承原始 MF
 │   └── main.py        # FastAPI 应用、请求/响应模型与 /analyze、/compare、/explain、/cidrs/hierarchy、/cidrs/diff、/routes/resolve、/routes/failover、/routes/audit、/firewall/simulate、/ipv4/reassemble、/ipv4/fragment 接口
 ├── tests/
@@ -2532,7 +2571,10 @@ oracle 属性测试（含二次切分后偏移连续、仅最终子片 MF=false�
   字节倍数（IHL 以 32 位字计；该规则由 `is_valid_header_length` 统一定
   义，`/ipv4/fragment` 与两个 HTTP 入口共用，非法值 422 时回传实际
   `header_bytes` 与完整 `allowed_values`），再做**唯一末片 → 非末片 8
-  字节对齐 → 65535 上限**的语义校验（顺序固定，无末片即无从锚定长度）。重组时以一个字节缓冲加每字节“首个写入分片”
+  字节对齐 → 逐片边界校验**的语义校验（顺序固定，无末片即无从锚定长度；
+  边界校验先于末片锚点裁剪：每片 `offset` ≤ 8191 且
+  `offset*8 + 载荷长度 + 首部长度` ≤ 65535，完全落在锚点外的分片同样
+  校验，违规即 422 而非默默裁剪）。重组时以一个字节缓冲加每字节“首个写入分片”
   归属数组单次扫描完成：重复覆盖逐字节比较，一致即接受、不一致则更新
   最小冲突偏移；扫描结束后冲突优先返回，否则把各片区间归并求其在
   `[0, 总载荷长度)` 的补集（闭区间差集再转半开），有缺口返回
