@@ -15,16 +15,23 @@
    ``offset*8 + len(payload)`` 确定总载荷长度。
 3. **数据报上限**：总载荷长度加首部长度不能越过 IPv4 数据报 65535 字节
    上限。
-4. **按字节区间重组**：每个分片占据半开字节区间
+4. **逐片边界（裁剪前）**：每片 ``offset`` 必须是片偏移字段可表达的
+   0～8191（8 字节单位），且
+   ``offset*8 + len(payload) + header_bytes`` 不得越过 65535。该校验对
+   **每个**分片执行——即使分片完全落在末片锚定总长度之外（随后仍会被
+   裁剪掉）也不例外，使畸形分片无法借“落在锚点外”被静默忽略。
+5. **按字节区间重组**：每个分片占据半开字节区间
    ``[offset*8, offset*8 + len(payload))``。重叠覆盖处字节必须一致，
    重复且字节一致的覆盖可接受；任一重叠字节冲突即报 ``conflict`` 与
    **首个冲突偏移**（全部分片中最小的不一致字节偏移），优先于缺口结论。
-5. 无冲突但相对 ``[0, 总载荷长度)`` 存在缺口时返回 ``incomplete`` 与
+6. 无冲突但相对 ``[0, 总载荷长度)`` 存在缺口时返回 ``incomplete`` 与
    合并后的缺失半开区间；覆盖完整时返回 ``complete``、按偏移排序的
    **贡献分片索引**（至少贡献一个总载荷字节的输入分片序号）与重组后的
    Base64 载荷。
 
-实现上先把每个分片裁剪成锚点内的半开字节区间，再对按起点排序的区间做
+实现上先完成首部、末片数量、非末片对齐、末片锚定总长度与**逐片偏移/
+边界**全部校验，再把每个分片裁剪成锚点内的半开字节区间，然后对按起点
+排序的区间做
 **扫描线**：在覆盖集不变的每个段内只做切片级比较（C 层 memcmp / memcpy，
 二分定位段内首个不一致偏移），既不为每个分片逐字节遍历，也不构造与总载荷
 等长的 owner 列表；段按偏移升序产出，故任意输入顺序下都能直接得到全局
@@ -60,6 +67,10 @@ IPV4_DATAGRAM_MAX = 65535
 #: 片偏移字段以 8 字节为单位
 OFFSET_UNIT = 8
 
+#: IPv4 片偏移字段为 13 位，最大值（以 8 字节为单位）。0～8191 的片偏移
+#: 是每个重组输入分片都必须满足的字段级约束（fragmentation 模块共用）
+FRAGMENT_OFFSET_MAX = 8191
+
 #: 重组结论
 COMPLETE = "complete"
 INCOMPLETE = "incomplete"
@@ -67,6 +78,7 @@ CONFLICT = "conflict"
 
 #: 输入错误类型（Web 层映射为 422 detail.error）
 ERR_INVALID_HEADER_LENGTH = "invalid_header_length"
+ERR_INVALID_FRAGMENT_OFFSET = "invalid_fragment_offset"
 ERR_NON_ALIGNED_FRAGMENT = "non_aligned_fragment"
 ERR_LAST_FRAGMENT_COUNT = "invalid_last_fragment_count"
 ERR_DATAGRAM_TOO_LARGE = "datagram_too_large"
@@ -75,11 +87,11 @@ ERR_DATAGRAM_TOO_LARGE = "datagram_too_large"
 class ReassemblyInputError(ValueError):
     """分片重组输入不合法（Web 层映射为 422）。
 
-    - ``error``：错误类型标识（``non_aligned_fragment`` /
-      ``invalid_last_fragment_count`` / ``datagram_too_large`` /
-      ``invalid_header_length``）；
+    - ``error``：错误类型标识（``invalid_header_length`` /
+      ``invalid_fragment_offset`` / ``non_aligned_fragment`` /
+      ``invalid_last_fragment_count`` / ``datagram_too_large``）；
     - ``indexes``：相关分片的输入序号（末片数量类问题给出全部末片序号，
-      对齐 / 超长类问题给出相关分片；与首部相关时为 ``[]``）；
+      偏移 / 对齐 / 超长类问题给出首个违规分片；与首部相关时为 ``[]``）；
     - ``limit``：越界错误附带的上限值（总长度类问题为 65535，其余为
       ``None``）；
     - ``header_bytes`` / ``allowed_values``：``invalid_header_length``
@@ -171,10 +183,15 @@ def _validate_common(
     """校验首部长度与分片列表规模，并逐片解析为字节区间表示。
 
     返回 ``(header_length, parsed_fragments)``；后者每项为
-    ``{"index", "offset_bytes", "more_fragments", "payload"}``。
+    ``{"index", "offset", "offset_bytes", "more_fragments",
+    "payload"}``，其中 ``offset`` 为原始 8 字节单位片偏移。
 
-    首部长度校验（20～60 内 4 的倍数）先于末片、对齐与 65535 上限等
-    全部后续判定，使多重非法输入得到稳定错误。
+    首部长度校验（20～60 内 4 的倍数）先于末片、对齐、逐片边界与 65535
+    上限等全部后续判定，使多重非法输入得到稳定错误。片偏移的类型 / 负数
+    等结构性输入错误在这里以 :class:`ValueError` 抛出（Web 层通常已在入口
+    拦截）；片偏移越过 13 位字段上限 8191 等**语义**越界由
+    :func:`reassemble_ipv4` 在末片数量、非末片对齐与末片锚定总长度校验
+    之后、锚点裁剪之前统一以 :class:`ReassemblyInputError` 报告。
     """
     header_length = validate_header_length(header_length)
 
@@ -206,6 +223,7 @@ def _validate_common(
         parsed.append(
             {
                 "index": index,
+                "offset": raw_offset,
                 "offset_bytes": raw_offset * OFFSET_UNIT,
                 "more_fragments": more_fragments,
                 "payload": payload,
@@ -225,7 +243,12 @@ def reassemble_ipv4(
     ``payload`` 为字节串（独立使用时也接受标准 Base64 字符串）。
 
     首部长度必须为 20～60 范围内 4 的倍数（20/24/…/60）；该校验先于
-    末片数量、非末片对齐与 65535 上限判定。
+    末片数量、非末片对齐、逐片边界与 65535 上限判定。语义校验按以下
+    固定次序进行：末片数量必须恰好一个；非末片载荷必须 8 字节对齐；
+    末片锚定的总载荷长度加首部不得越过 65535；随后在锚点裁剪前对
+    **每个分片**（含完全落在锚点之外、随后会被整段裁剪掉的分片）校验
+    片偏移在 0～8191 内，且
+    ``offset*8 + len(payload) + header_length`` 不越过 65535。
 
     返回结构（按结论三选一，无多余键）：
 
@@ -239,7 +262,8 @@ def reassemble_ipv4(
       ``(字节偏移, 输入序号)`` 升序排列，载荷为重组后字节的标准 Base64。
 
     语义类输入错误抛出 :class:`ReassemblyInputError`（首部长度非法、
-    非末片未按 8 字节对齐、末片数量不为一、总长度越过 65535）；
+    片偏移越过 8191、非末片未按 8 字节对齐、末片数量不为一、末片锚定
+    总长度或任一分片自身边界越过 65535）；
     非法 Base64、offset 类型/负数等抛出 :class:`ValueError`（Web 层
     通常已在入口拦截）。
     """
@@ -275,6 +299,34 @@ def reassemble_ipv4(
             indexes=[last_index],
             limit=IPV4_DATAGRAM_MAX,
         )
+
+    # 逐片边界校验（锚点裁剪前）：片偏移必须落在 13 位字段范围 0～8191，
+    # 且本片自身的绝对结束位置 offset*8 + 载荷长度 + 首部长度不得越过
+    # 65535。该校验对**每一片**生效——即使分片完全落在末片锚定总长度
+    # 之外（下一步会被整段裁剪）也不例外，使畸形分片不能借“落在锚点外”
+    # 被静默忽略。按输入序号报告首个违规分片。
+    for fragment in parsed:
+        index = fragment["index"]
+        offset = fragment["offset"]
+        if not 0 <= offset <= FRAGMENT_OFFSET_MAX:
+            raise ReassemblyInputError(
+                ERR_INVALID_FRAGMENT_OFFSET,
+                f"分片 {index} 的 offset 必须在 0～{FRAGMENT_OFFSET_MAX} "
+                f"之间（IPv4 片偏移字段为 13 位），实际 {offset}",
+                indexes=[index],
+            )
+        fragment_end = header_length + fragment["offset_bytes"] + len(
+            fragment["payload"]
+        )
+        if fragment_end > IPV4_DATAGRAM_MAX:
+            raise ReassemblyInputError(
+                ERR_DATAGRAM_TOO_LARGE,
+                f"分片 {index} 的绝对结束位置 {fragment_end}（offset*8 + "
+                f"载荷长度 {len(fragment['payload'])} + 首部长度 "
+                f"{header_length}）越过 IPv4 {IPV4_DATAGRAM_MAX} 字节上限",
+                indexes=[index],
+                limit=IPV4_DATAGRAM_MAX,
+            )
 
     # 区间化：将每个分片裁剪为半开字节区间 [start, end) 与对应载荷
     # （越出末片锚定总长度的部分不参与数据报重组）。零长度 / 完全越界的

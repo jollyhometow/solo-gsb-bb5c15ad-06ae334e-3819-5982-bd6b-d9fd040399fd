@@ -5,6 +5,7 @@ import pytest
 
 from app.reassembly import (
     FRAGMENTS_MAX,
+    FRAGMENT_OFFSET_MAX,
     HEADER_ALLOWED,
     HEADER_MAX,
     HEADER_MIN,
@@ -526,6 +527,244 @@ def test_datagram_limit_respects_header_bytes():
             60, [frag(0, True, b"\x00" * 65472), frag(8184, False, b"\x00" * 4)]
         )
     assert exc_info.value.error == "datagram_too_large"
+
+
+# ---------- 逐片偏移 / 边界（末片锚点裁剪前） ----------
+
+
+def test_offset_above_field_max_empty_payload():
+    # offset=8192 超出 13 位片偏移字段上限；即使是不承载任何字节的空载荷片
+    with pytest.raises(ReassemblyInputError) as exc_info:
+        reassemble_ipv4(20, [frag(0, False, b"hello"), frag(8192, True, b"")])
+    error = exc_info.value
+    assert error.error == "invalid_fragment_offset"
+    assert error.indexes == [1]
+    assert error.limit is None
+
+
+def test_offset_above_field_max_nonempty_reports_fragment_index():
+    with pytest.raises(ReassemblyInputError) as exc_info:
+        reassemble_ipv4(
+            20,
+            [
+                frag(0, True, b"abcdefgh"),
+                frag(FRAGMENT_OFFSET_MAX + 100, True, b"X" * 8),
+                frag(1, False, b"ij"),
+            ],
+        )
+    error = exc_info.value
+    assert error.error == "invalid_fragment_offset"
+    assert error.indexes == [1]
+
+
+def test_offset_entirely_beyond_anchor_still_validated():
+    # 末片锚定总长度仅 5；index 1 完全落在锚点之外（offset*8=65536），
+    # 不能被静默裁剪忽略：offset=8192 越过 8191 必须报错
+    with pytest.raises(ReassemblyInputError) as exc_info:
+        reassemble_ipv4(
+            20,
+            [
+                frag(0, False, b"hello"),
+                frag(FRAGMENT_OFFSET_MAX + 1, True, b"Z" * 8),
+            ],
+        )
+    assert exc_info.value.error == "invalid_fragment_offset"
+    assert exc_info.value.indexes == [1]
+
+
+def test_fragment_own_end_beyond_65535_even_when_outside_anchor():
+    # 末片锚定总长度 12；index 2 的非末片从 offset 8190 起承载 24 字节，
+    # 完全落在锚点之外，但 offset*8 + 24 + 20 = 65564 > 65535
+    with pytest.raises(ReassemblyInputError) as exc_info:
+        reassemble_ipv4(
+            20,
+            [
+                frag(0, True, b"abcdefgh"),
+                frag(1, False, b"ijkl"),
+                frag(8190, True, b"m" * 24),
+            ],
+        )
+    error = exc_info.value
+    assert error.error == "datagram_too_large"
+    assert error.indexes == [2]
+    assert error.limit == IPV4_DATAGRAM_MAX
+
+
+def test_fragment_end_at_max_legal_boundary_ok():
+    # 非末片载荷须 8 字节对齐、首部 20 ≡ 4 (mod 8)，故非末片最大合法结束
+    # 位置为 65532：offset 8188（65504 字节）+ 8 字节载荷 + 20 首部 = 65532。
+    # 该片落在一个更小的末片锚点之外但边界合法，仍按原语义裁剪
+    result = reassemble_ipv4(
+        HEADER_MIN,
+        [
+            frag(0, True, b"abcdefgh"),
+            frag(1, False, b"ijkl"),
+            frag(8188, True, b"\x00" * 8),
+        ],
+    )
+    assert result["status"] == "complete"
+    assert result["contributing_fragments"] == [0, 1]
+    assert base64.b64decode(result["payload"]) == b"abcdefghijkl"
+    # 同偏移空载荷片（结束位置 65524）同样合法
+    result = reassemble_ipv4(
+        HEADER_MIN,
+        [frag(0, False, b"x"), frag(8189, True, b"")],
+    )
+    assert result["status"] == "complete"
+    assert result["contributing_fragments"] == [0]
+
+
+def test_fragment_end_over_boundary_rejected():
+    # 紧邻的下一片：offset 8189 + 8 字节 + 20 = 65540 > 65535
+    with pytest.raises(ReassemblyInputError) as exc_info:
+        reassemble_ipv4(
+            20,
+            [
+                frag(0, True, b"abcdefgh"),
+                frag(1, False, b"ijkl"),
+                frag(8189, True, b"\x00" * 8),
+            ],
+        )
+    error = exc_info.value
+    assert error.error == "datagram_too_large"
+    assert error.indexes == [2]
+    assert error.limit == IPV4_DATAGRAM_MAX
+
+
+def test_offset_max_8191_empty_fragment_exceeds_datagram_with_header():
+    # offset=8191 本身是合法的 13 位字段值，但即使空载荷：
+    # 8191*8 + 0 + 20 = 65548 > 65535，故报 datagram_too_large
+    with pytest.raises(ReassemblyInputError) as exc_info:
+        reassemble_ipv4(20, [frag(0, False, b""), frag(FRAGMENT_OFFSET_MAX, True, b"")])
+    error = exc_info.value
+    assert error.error == "datagram_too_large"
+    assert error.indexes == [1]
+    assert error.limit == IPV4_DATAGRAM_MAX
+
+
+def test_per_fragment_validation_reports_first_violating_index_in_order():
+    # 两个越界片（index 1 end 越界、index 2 offset 越界）：按输入序号报告
+    with pytest.raises(ReassemblyInputError) as exc_info:
+        reassemble_ipv4(
+            20,
+            [
+                frag(0, True, b"abcdefgh"),
+                frag(1, False, b"ijkl"),
+                frag(8190, True, b"m" * 24),
+                frag(FRAGMENT_OFFSET_MAX + 1, True, b"Z" * 8),
+            ],
+        )
+    assert exc_info.value.error == "datagram_too_large"
+    assert exc_info.value.indexes == [2]
+    # 越界片排在后面时，前面的 offset 违规先报
+    with pytest.raises(ReassemblyInputError) as exc_info:
+        reassemble_ipv4(
+            20,
+            [
+                frag(0, True, b"abcdefgh"),
+                frag(1, False, b"ijkl"),
+                frag(FRAGMENT_OFFSET_MAX + 1, True, b"Z" * 8),
+                frag(8190, True, b"m" * 24),
+            ],
+        )
+    assert exc_info.value.error == "invalid_fragment_offset"
+    assert exc_info.value.indexes == [2]
+
+
+def test_per_fragment_end_limit_respects_header_bytes():
+    # 60 字节首部、非末片 8 字节对齐载荷：offset 8183（65464）+ 8 + 60
+    # = 65532 恰好为该粒度下最大合法值
+    result = reassemble_ipv4(
+        60,
+        [
+            frag(0, True, b"abcdefgh"),
+            frag(1, False, b"ijkl"),
+            frag(8183, True, b"\x00" * 8),
+        ],
+    )
+    assert result["status"] == "complete"
+    # 下一个 8 字节边界：65472 + 8 + 60 = 65540 > 65535
+    with pytest.raises(ReassemblyInputError) as exc_info:
+        reassemble_ipv4(
+            60,
+            [
+                frag(0, True, b"abcdefgh"),
+                frag(1, False, b"ijkl"),
+                frag(8184, True, b"\x00" * 8),
+            ],
+        )
+    assert exc_info.value.error == "datagram_too_large"
+    assert exc_info.value.indexes == [2]
+    # 空载荷非末片（不要求对齐）：65472 + 0 + 60 = 65532 合法
+    result = reassemble_ipv4(
+        60, [frag(0, False, b"x"), frag(8184, True, b"")]
+    )
+    assert result["status"] == "complete"
+
+
+def test_legal_fragment_outside_anchor_still_clipped():
+    # 完全落在锚点之外但自身边界合法的分片仍按既有语义裁剪：贡献与结论不变
+    result = reassemble_ipv4(
+        20,
+        [
+            frag(0, True, b"abcdefgh"),
+            frag(1, False, b"ijkl"),
+            frag(2, True, b"mooooooo"),
+        ],
+    )
+    assert result["status"] == "complete"
+    assert result["contributing_fragments"] == [0, 1]
+    assert base64.b64decode(result["payload"]) == b"abcdefghijkl"
+
+
+def test_validation_order_per_fragment_checks_after_anchor_rules():
+    # 无末片 + 越界片：先报末片数量
+    with pytest.raises(ReassemblyInputError) as exc_info:
+        reassemble_ipv4(
+            20, [frag(0, True, b"\x00" * 8), frag(FRAGMENT_OFFSET_MAX + 1, True, b"")]
+        )
+    assert exc_info.value.error == "invalid_last_fragment_count"
+    # 多末片 + 越界片：先报末片数量（indexes 为全部末片）
+    with pytest.raises(ReassemblyInputError) as exc_info:
+        reassemble_ipv4(
+            20,
+            [frag(0, False, b""), frag(FRAGMENT_OFFSET_MAX + 1, True, b""),
+             frag(2, False, b"")],
+        )
+    assert exc_info.value.error == "invalid_last_fragment_count"
+    assert exc_info.value.indexes == [0, 2]
+    # 非末片未对齐 + 越界 offset：先报非末片对齐（按输入序号首个对齐违规片）
+    with pytest.raises(ReassemblyInputError) as exc_info:
+        reassemble_ipv4(
+            20,
+            [frag(0, True, b"abc"),
+             frag(FRAGMENT_OFFSET_MAX + 1, True, b"\x00" * 8),
+             frag(2, False, b"")],
+        )
+    assert exc_info.value.error == "non_aligned_fragment"
+    assert exc_info.value.indexes == [0]
+    # 锚定总长度越界 + 其它片 offset 越界：先报锚定总长度（末片）
+    with pytest.raises(ReassemblyInputError) as exc_info:
+        reassemble_ipv4(
+            20,
+            [frag(FRAGMENT_OFFSET_MAX + 1, True, b"\x00" * 8),
+             frag(8189, False, b"\x00" * 4)],
+        )
+    assert exc_info.value.error == "datagram_too_large"
+    assert exc_info.value.indexes == [1]
+
+
+def test_header_error_still_precedes_fragment_boundary_errors():
+    # 非法首部长度 + offset 越界：稳定返回 invalid_header_length
+    with pytest.raises(ReassemblyInputError) as exc_info:
+        reassemble_ipv4(
+            21,
+            [frag(0, True, b"abcdefgh"),
+             frag(FRAGMENT_OFFSET_MAX + 1, True, b""),
+             frag(1, False, b"")],
+        )
+    assert exc_info.value.error == "invalid_header_length"
+    assert exc_info.value.header_bytes == 21
 
 
 def test_invalid_header_length():

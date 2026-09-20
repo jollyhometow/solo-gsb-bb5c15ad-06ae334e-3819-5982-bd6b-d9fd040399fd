@@ -29,13 +29,13 @@ from .firewall import (
     simulate_firewall,
 )
 from .fragmentation import (
-    FRAGMENT_OFFSET_MAX,
     MTU_MIN,
     FragmentationInputError,
     plan_ipv4_fragmentation,
 )
 from .reassembly import (
     FRAGMENTS_MAX,
+    FRAGMENT_OFFSET_MAX,
     HEADER_ALLOWED,
     HEADER_MAX,
     HEADER_MIN,
@@ -83,9 +83,12 @@ app = FastAPI(
         "last_seen 淘汰最早的存活会话。"
         "通过 /ipv4/reassemble 对同一 IPv4 数据报的 1～500 个分片按字节"
         "区间重组：非末片载荷按 8 字节对齐，唯一末片锚定总载荷长度，"
-        "越过 65535 字节数据报上限报错；重复一致覆盖可接受，重叠字节冲突"
-        "返回首个冲突偏移，无冲突但有缺口返回合并后的缺失半开区间，覆盖"
-        "完整时返回贡献分片索引与重组后的 Base64 载荷。"
+        "越过 65535 字节数据报上限报错；每个分片（即使完全落在末片锚点"
+        "之外）都必须满足 offset 在 0～8191 且 offset*8+载荷长度+首部"
+        "不越过 65535，否则同样 422 并给出违规分片索引；重复一致覆盖"
+        "可接受，重叠字节冲突返回首个冲突偏移，无冲突但有缺口返回合并"
+        "后的缺失半开区间，覆盖完整时返回贡献分片索引与重组后的 Base64 "
+        "载荷。"
         "通过 /ipv4/fragment 做反向的分片规划：给定 Base64 载荷、"
         "20～60 范围内 4 字节倍数（20/24/…/60）字节首部长度、MTU 与 DF "
         "标志（可选原始片偏移与原始 MF），"
@@ -95,7 +98,7 @@ app = FastAPI(
         "needs_fragmentation（不输出载荷），其余情况按不超过 MTU 的最大 "
         "8 字节倍数切片，子片偏移叠加原始片偏移、末子片继承原始 MF。"
     ),
-    version="1.12.0",
+    version="1.13.0",
 )
 
 
@@ -955,7 +958,13 @@ class IPv4Fragment(BaseModel):
 
     offset: int = Field(
         ..., ge=0, strict=True,
-        description="片偏移（fragment offset），以 8 字节为单位的非负整数",
+        description=(
+            "片偏移（fragment offset），以 8 字节为单位的非负整数，"
+            "必须在 0～8191 之间；超过 8191 或使本片绝对结束位置 "
+            "offset*8 + len(payload) + header_bytes 越过 65535 时，"
+            "即使分片完全落在末片锚点之外，也返回 422 "
+            "（invalid_fragment_offset / datagram_too_large）并给出本分片索引"
+        ),
     )
     more_fragments: bool = Field(
         ...,
@@ -2091,7 +2100,30 @@ def firewall_simulate(
                                     "limit": 65535,
                                 }
                             },
-                        }
+                        },
+                        "invalid_fragment_offset": {
+                            "summary": "分片 offset 越过片偏移字段 13 位上限 8191",
+                            "value": {
+                                "detail": {
+                                    "error": "invalid_fragment_offset",
+                                    "indexes": [2],
+                                    "limit": None,
+                                }
+                            },
+                        },
+                        "fragment_beyond_anchor_too_large": {
+                            "summary": (
+                                "完全落在末片锚点之外的分片自身边界越过 "
+                                "65535：仍报 422 而非裁剪忽略"
+                            ),
+                            "value": {
+                                "detail": {
+                                    "error": "datagram_too_large",
+                                    "indexes": [2],
+                                    "limit": 65535,
+                                }
+                            },
+                        },
                     }
                 }
             }
@@ -2155,6 +2187,14 @@ def ipv4_reassemble(
       ``offset*8 + len(payload)`` 锚定总载荷长度；
     - **长度上限**：首部长度 + 总载荷长度越过 IPv4 数据报 **65535** 字节上限
       时返回 **422**（``error="datagram_too_large"``）；分片数 1～500；
+    - **逐片边界（末片锚点裁剪前）**：每个分片的 ``offset`` 必须是片偏移
+      字段可表达的 **0～8191**（8 字节单位），否则返回 **422**
+      （``error="invalid_fragment_offset"``）；且每片自身的绝对结束位置
+      ``offset*8 + len(payload) + header_bytes`` 不得越过 **65535**，否则
+      返回 **422**（``error="datagram_too_large"``）。两类错误都在
+      ``indexes`` 中给出**首个违规分片的输入序号**。校验对**每个**分片
+      生效——**即使分片完全落在末片锚定总长度之外**（随后合法部分仍会按
+      锚点裁剪）也不例外，畸形分片不会被静默忽略；
     - **重叠处理**：重复覆盖且重叠字节完全一致可接受；任一重叠字节不一致即
       返回 ``status="conflict"`` 与 **首个冲突偏移**
       ``first_conflict_offset``（全部分片中最小的不一致字节偏移，冲突结论
@@ -2166,6 +2206,10 @@ def ipv4_reassemble(
       ``(字节偏移, 输入序号)`` 升序的**贡献分片索引**
       ``contributing_fragments``（至少贡献一个总载荷字节的分片；空载荷或
       完全越界的分片不计入）与重组后完整载荷的标准 Base64 ``payload``。
+
+    通过上述逐片边界校验后，合法但落在末片锚定总长度之外的字节仍按既有
+    语义裁剪：仅锚点内的半开字节区间参与重叠校验与补全，完全落在锚点外的
+    分片不贡献结果。
 
     非法 Base64、负/非整数 ``offset``、非布尔 ``more_fragments``、字段缺失等
     同样返回 **422**。

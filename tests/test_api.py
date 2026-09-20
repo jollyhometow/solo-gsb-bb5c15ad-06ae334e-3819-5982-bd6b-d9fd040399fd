@@ -2129,6 +2129,100 @@ def test_reassemble_exact_limit_200():
     assert resp.json()["status"] == "complete"
 
 
+def test_reassemble_offset_above_8191_422():
+    # offset=8192 越过 13 位片偏移字段上限，空载荷片同样报错
+    resp = post_reassemble(20, [fr(0, False, b"hello"), fr(8192, True, b"")])
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == {
+        "error": "invalid_fragment_offset",
+        "indexes": [1],
+        "limit": None,
+    }
+
+
+def test_reassemble_offset_above_8191_outside_anchor_422():
+    # 末片锚定总长度仅 5；index 1 完全落在锚点之外也不得被忽略
+    resp = post_reassemble(20, [fr(0, False, b"hello"), fr(8192, True, b"ZZZZZZZZ")])
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "invalid_fragment_offset"
+    assert detail["indexes"] == [1]
+
+
+def test_reassemble_fragment_own_end_too_large_outside_anchor_422():
+    # index 2 从 offset 8190 起 24 字节，完全落在锚点之外，但
+    # 8190*8 + 24 + 20 = 65564 > 65535
+    resp = post_reassemble(
+        20,
+        [
+            fr(0, True, b"abcdefgh"),
+            fr(1, False, b"ijkl"),
+            fr(8190, True, b"m" * 24),
+        ],
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == {
+        "error": "datagram_too_large",
+        "indexes": [2],
+        "limit": 65535,
+    }
+
+
+def test_reassemble_legal_outside_anchor_fragment_still_clipped_200():
+    # 合法（offset ≤ 8191 且自身不越 65535）但完全落在锚点外的分片仍裁剪
+    resp = post_reassemble(
+        20,
+        [
+            fr(0, True, b"abcdefgh"),
+            fr(1, False, b"ijkl"),
+            fr(8188, True, b"\x00" * 8),
+        ],
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "complete"
+    assert body["contributing_fragments"] == [0, 1]
+
+
+def test_reassemble_boundary_violation_reports_first_index_422():
+    # index 2 end 越界在前、index 3 offset 越界在后：按输入序号报首个
+    resp = post_reassemble(
+        20,
+        [
+            fr(0, True, b"abcdefgh"),
+            fr(1, False, b"ijkl"),
+            fr(8190, True, b"m" * 24),
+            fr(8192, True, b"Z" * 8),
+        ],
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["error"] == "datagram_too_large"
+    assert resp.json()["detail"]["indexes"] == [2]
+
+
+def test_reassemble_per_fragment_checks_order_422():
+    # 无末片 + offset 越界：先报末片数量
+    resp = post_reassemble(20, [fr(0, True, b"\x00" * 8), fr(8192, True, b"")])
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["error"] == "invalid_last_fragment_count"
+    # 非末片未对齐 + offset 越界：先报非末片对齐
+    resp = post_reassemble(
+        20, [fr(0, True, b"abc"), fr(8192, True, b"\x00" * 8), fr(2, False, b"")]
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "non_aligned_fragment"
+    assert detail["indexes"] == [0]
+    # 锚定总长度越界 + 其它片 offset 越界：先报锚定总长度（末片）
+    resp = post_reassemble(
+        20, [fr(8192, True, b"\x00" * 8), fr(8189, False, b"\x00" * 4)]
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "datagram_too_large"
+    assert detail["indexes"] == [1]
+
+
 def test_reassemble_header_boundaries_200():
     # 20～60 内的全部 4 字节倍数均合法
     for header in range(20, 61, 4):
@@ -2182,6 +2276,12 @@ def test_reassemble_header_error_takes_priority_422():
     detail = resp.json()["detail"]
     assert detail["error"] == "invalid_header_length"
     assert detail["header_bytes"] == 21
+    # 非法首部长度 + offset 越过 8191：首部校验同样最先
+    resp = post_reassemble(
+        21, [fr(0, True, b"abcdefgh"), fr(8192, True, b""), fr(1, False, b"")]
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["error"] == "invalid_header_length"
 
 
 def test_reassemble_validation_422():

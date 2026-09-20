@@ -33,6 +33,7 @@ from __future__ import annotations
 import base64
 
 from .reassembly import (
+    FRAGMENT_OFFSET_MAX,
     HEADER_ALLOWED,
     HEADER_MAX,
     HEADER_MIN,
@@ -46,8 +47,8 @@ from .reassembly import (
 #: MTU 取值下限（正整数，单位字节）
 MTU_MIN = 1
 
-#: IPv4 片偏移字段为 13 位，最大值（以 8 字节为单位）
-FRAGMENT_OFFSET_MAX = 8191
+# FRAGMENT_OFFSET_MAX 由 reassembly 定义并在此再导出（IPv4 片偏移字段为
+# 13 位，重组与规划两侧共用同一上限）
 
 #: 规划结论
 UNFRAGMENTED = "unfragmented"
